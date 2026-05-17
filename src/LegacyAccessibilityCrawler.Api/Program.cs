@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json.Serialization;
 using LegacyAccessibilityCrawler.Core;
 using LegacyAccessibilityCrawler.Infrastructure;
@@ -36,21 +38,18 @@ builder.Services.AddSingleton<IManualFindingsImporter, ManualFindingsImporter>()
 builder.Services.AddSingleton<IReportGenerator, ReportGenerator>();
 builder.Services.AddSingleton<ILlmReviewService, DisabledLlmReviewService>();
 builder.Services.AddSingleton<JobStore>();
+builder.Services.AddSingleton(ApiKeySecurity.LoadFromEnvironment());
 
 var app = builder.Build();
-app.UseSwagger();
-app.UseSwaggerUI();
-app.UseDefaultFiles();
-app.UseStaticFiles();
 app.Use(async (context, next) =>
 {
-    if (!ApiKeySecurity.IsApiRouteRequiringKey(context.Request.Path))
+    if (!ApiKeySecurity.IsProtectedRoute(context.Request.Path))
     {
         await next();
         return;
     }
 
-    var configuredKeys = context.RequestServices.GetRequiredService<IConfiguration>().GetSection("ApiSecurity:ApiKeys").Get<string[]>() ?? [];
+    var configuredKeys = context.RequestServices.GetRequiredService<ApiKeyMaterial>();
     if (ApiKeySecurity.IsValid(context.Request.Headers["x-api-key"], configuredKeys))
     {
         await next();
@@ -60,6 +59,18 @@ app.Use(async (context, next) =>
     context.Response.StatusCode = StatusCodes.Status401Unauthorized;
     await context.Response.WriteAsJsonAsync(new { error = "A valid x-api-key header is required for API routes." });
 });
+
+if (app.Environment.IsDevelopment() || app.Configuration.GetValue<bool>("Security:EnableSwagger"))
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+if (app.Environment.IsDevelopment() || app.Configuration.GetValue<bool>("Security:EnableUi"))
+{
+    app.UseDefaultFiles();
+    app.UseStaticFiles();
+}
 
 app.MapGet("/", () => Results.Redirect("/ui/"));
 
@@ -88,6 +99,8 @@ app.MapPost("/api/crawl/start", async (CrawlerOptions options, JobStore jobs, IS
     var job = jobs.Create("crawl");
     _ = Task.Run(async () =>
     {
+        using var jobTimeout = new CancellationTokenSource(TimeSpan.FromMinutes(ApiRequestGuards.JobTimeoutMinutes(configuration)));
+        var jobToken = jobTimeout.Token;
         try
         {
             using var scope = services.CreateScope();
@@ -101,12 +114,12 @@ app.MapPost("/api/crawl/start", async (CrawlerOptions options, JobStore jobs, IS
             var pdfRules = new List<AccessibilityRule>();
             if (normalizedOptions.EnablePdfRuleOverlay && !string.IsNullOrWhiteSpace(normalizedOptions.RulesPdfPath))
             {
-                var extracted = await pdf.ExtractAsync(normalizedOptions.RulesPdfPath, Path.Combine(normalizedOptions.OutputDirectory, "rules"), cancellationToken);
+                var extracted = await pdf.ExtractAsync(normalizedOptions.RulesPdfPath, Path.Combine(normalizedOptions.OutputDirectory, "rules"), jobToken);
                 pdfRules.AddRange(extracted.Rules);
             }
 
-            var rules = await rulePack.LoadRulesAsync(normalizedOptions.EnableSection508Rules, normalizedOptions.EnableWcag22EnhancedRules, pdfRules, cancellationToken);
-            var pages = await crawler.CrawlAsync(normalizedOptions, cancellationToken);
+            var rules = await rulePack.LoadRulesAsync(normalizedOptions.EnableSection508Rules, normalizedOptions.EnableWcag22EnhancedRules, pdfRules, jobToken);
+            var pages = await crawler.CrawlAsync(normalizedOptions, jobToken);
             var findings = matcher.EnrichFindings(pages.SelectMany(p => engine.Analyze(p, rules)), rules);
             var result = new ScanResult
             {
@@ -116,7 +129,7 @@ app.MapPost("/api/crawl/start", async (CrawlerOptions options, JobStore jobs, IS
                 RulesUsed = rules,
                 Disclaimer = normalizedOptions.BrowserMode == BrowserMode.EdgeIeModeAssisted ? $"{ComplianceDisclaimers.Standard} {ComplianceDisclaimers.IeMode}" : ComplianceDisclaimers.Standard
             };
-            var manifest = await reporting.GenerateAsync(result, normalizedOptions.OutputDirectory, cancellationToken);
+            var manifest = await reporting.GenerateAsync(result, normalizedOptions.OutputDirectory, jobToken);
             jobs.Complete(job.Id, new { result.ScanId, manifest });
         }
         catch (Exception ex)
@@ -132,16 +145,27 @@ app.MapPost("/api/rules/extract", async (RulesExtractRequest request, IPdfRulesL
     try
     {
         var output = ApiRequestGuards.ResolveOutputDirectory(request.OutputDirectory, configuration);
-        return Results.Ok(await pdf.ExtractAsync(request.RulesPdfPath, output, cancellationToken));
+        var pdfPath = ApiRequestGuards.ResolvePdfInputPath(request.RulesPdfPath, configuration);
+        return Results.Ok(await pdf.ExtractAsync(pdfPath, output, cancellationToken));
     }
-    catch (ArgumentException ex)
+    catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException)
     {
-        return Results.BadRequest(new { error = ex.Message });
+        return Results.BadRequest(new { error = "The requested PDF could not be loaded from the configured input directory." });
     }
 });
 
-app.MapPost("/api/findings/import", async (ManualFindingsImportRequest request, IManualFindingsImporter importer, CancellationToken cancellationToken) =>
-    await importer.ImportAsync(request.CsvPath, cancellationToken));
+app.MapPost("/api/findings/import", async (ManualFindingsImportRequest request, IManualFindingsImporter importer, IConfiguration configuration, CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var csvPath = ApiRequestGuards.ResolveCsvInputPath(request.CsvPath, configuration);
+        return Results.Ok(await importer.ImportAsync(csvPath, cancellationToken));
+    }
+    catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException)
+    {
+        return Results.BadRequest(new { error = "The requested CSV could not be loaded from the configured input directory." });
+    }
+});
 
 app.MapPost("/api/report/generate", async (ScanResult result, IReportGenerator generator, IConfiguration configuration, CancellationToken cancellationToken) =>
 {
@@ -266,33 +290,108 @@ public sealed class JobStore
 
 public static class ApiKeySecurity
 {
-    public static bool IsApiRouteRequiringKey(PathString path) =>
-        path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase);
+    public static bool IsProtectedRoute(PathString path) =>
+        path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase) ||
+        path.StartsWithSegments("/swagger", StringComparison.OrdinalIgnoreCase) ||
+        path.StartsWithSegments("/ui", StringComparison.OrdinalIgnoreCase);
 
-    public static bool IsValid(string? suppliedKey, IEnumerable<string> configuredKeys)
+    public static ApiKeyMaterial LoadFromEnvironment()
+    {
+        var keys = new[]
+            {
+                Environment.GetEnvironmentVariable("ApiSecurity__ApiKeys__0"),
+                Environment.GetEnvironmentVariable("LEGACY_A11Y_API_KEY")
+            }
+            .Concat((Environment.GetEnvironmentVariable("LEGACY_A11Y_API_KEYS") ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            .Where(key => !string.IsNullOrWhiteSpace(key) && key.Length >= 16)
+            .Distinct(StringComparer.Ordinal)
+            .Select(key => Hash(key!))
+            .ToArray();
+
+        if (keys.Length == 0)
+        {
+            throw new InvalidOperationException("No API key is configured. Set ApiSecurity__ApiKeys__0 or LEGACY_A11Y_API_KEY in the environment.");
+        }
+
+        return new ApiKeyMaterial(keys);
+    }
+
+    public static bool IsValid(string? suppliedKey, ApiKeyMaterial configuredKeys)
     {
         if (string.IsNullOrWhiteSpace(suppliedKey))
         {
             return false;
         }
 
-        return configuredKeys
-            .Where(key => !string.IsNullOrWhiteSpace(key))
-            .Any(key => string.Equals(key.Trim(), suppliedKey, StringComparison.Ordinal));
+        var suppliedHash = Hash(suppliedKey);
+        return configuredKeys.Sha256Hashes.Any(hash => CryptographicOperations.FixedTimeEquals(hash, suppliedHash));
     }
+
+    private static byte[] Hash(string value) => SHA256.HashData(Encoding.UTF8.GetBytes(value.Trim()));
 }
+
+public sealed record ApiKeyMaterial(IReadOnlyList<byte[]> Sha256Hashes);
 
 public static class ApiRequestGuards
 {
     public static CrawlerOptions NormalizeCrawlerOptions(CrawlerOptions options, IConfiguration configuration)
     {
         var allowedDomains = configuration.GetSection("Crawler:AllowedDomains").Get<string[]>() ?? [];
-        return CrawlRequestValidator.ValidateAndNormalize(options, allowedDomains, BaseOutputDirectory(configuration));
+        var security = SecurityOptions(configuration);
+        var normalized = CrawlRequestValidator.ValidateAndNormalize(
+            options,
+            allowedDomains,
+            BaseOutputDirectory(configuration),
+            security.AllowPrivateNetworkTargets,
+            security.MaxPagesLimit,
+            security.MaxDepthLimit,
+            security.MaxDelaySecondsLimit);
+
+        if (!string.IsNullOrWhiteSpace(normalized.RulesPdfPath))
+        {
+            normalized = normalized with { RulesPdfPath = ResolvePdfInputPath(normalized.RulesPdfPath, configuration) };
+        }
+
+        return normalized;
     }
 
     public static string ResolveOutputDirectory(string? requestedPath, IConfiguration configuration) =>
         OutputPathSanitizer.ResolveOutputDirectory(requestedPath, BaseOutputDirectory(configuration));
 
+    public static string ResolvePdfInputPath(string requestedPath, IConfiguration configuration)
+    {
+        var input = FileInputOptions(configuration);
+        return FileInputValidator.ResolveExistingFile(requestedPath, input.BaseInputDirectory, ".pdf", input.MaxPdfBytes);
+    }
+
+    public static string ResolveCsvInputPath(string requestedPath, IConfiguration configuration)
+    {
+        var input = FileInputOptions(configuration);
+        return FileInputValidator.ResolveExistingFile(requestedPath, input.BaseInputDirectory, ".csv", input.MaxCsvBytes);
+    }
+
+    public static int JobTimeoutMinutes(IConfiguration configuration) =>
+        Math.Clamp(configuration.GetValue<int?>("Security:JobTimeoutMinutes") ?? 30, 1, 240);
+
     private static string BaseOutputDirectory(IConfiguration configuration) =>
         configuration.GetValue<string>("Security:BaseOutputDirectory") ?? "reports";
+
+    private static string BaseInputDirectory(IConfiguration configuration) =>
+        configuration.GetValue<string>("Security:BaseInputDirectory") ?? "inputs";
+
+    private static CrawlSecurityOptions SecurityOptions(IConfiguration configuration) => new()
+    {
+        AllowPrivateNetworkTargets = configuration.GetValue<bool>("Security:AllowPrivateNetworkTargets"),
+        MaxPagesLimit = configuration.GetValue<int?>("Security:MaxPagesLimit") ?? 100,
+        MaxDepthLimit = configuration.GetValue<int?>("Security:MaxDepthLimit") ?? 5,
+        MaxDelaySecondsLimit = configuration.GetValue<int?>("Security:MaxDelaySecondsLimit") ?? 30,
+        JobTimeoutMinutes = JobTimeoutMinutes(configuration)
+    };
+
+    private static FileInputOptions FileInputOptions(IConfiguration configuration) => new()
+    {
+        BaseInputDirectory = BaseInputDirectory(configuration),
+        MaxPdfBytes = configuration.GetValue<long?>("Security:MaxPdfBytes") ?? 25 * 1024 * 1024,
+        MaxCsvBytes = configuration.GetValue<long?>("Security:MaxCsvBytes") ?? 5 * 1024 * 1024
+    };
 }

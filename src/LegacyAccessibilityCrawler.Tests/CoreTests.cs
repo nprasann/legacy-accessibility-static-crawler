@@ -1,6 +1,8 @@
 using LegacyAccessibilityCrawler.Core;
 using LegacyAccessibilityCrawler.Infrastructure;
 using LegacyAccessibilityCrawler.Reporting;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace LegacyAccessibilityCrawler.Tests;
 
@@ -119,6 +121,40 @@ public sealed class CoreTests
     }
 
     [Fact]
+    public async Task ReportGeneration_EncodesHtmlAndNeutralizesCsvFormulas()
+    {
+        var output = Path.Combine(Path.GetTempPath(), "legacy-a11y-report-security-tests", Guid.NewGuid().ToString("N"));
+        var payload = "\"><script>alert(1)</script>";
+        var result = new ScanResult
+        {
+            Options = new CrawlerOptions { OutputDirectory = output },
+            Pages = [new PageCapture { SanitizedUrl = payload, BrowserMode = BrowserMode.ModernEdge }],
+            Findings =
+            [
+                new AccessibilityFinding
+                {
+                    PageUrl = "=HYPERLINK(\"https://attacker.test\")",
+                    RuleId = payload,
+                    Standard = "WCAG 2.1",
+                    SuccessCriterion = "1.1.1",
+                    IssueType = payload,
+                    Severity = Severity.High,
+                    Evidence = payload,
+                    BrowserMode = BrowserMode.ModernEdge
+                }
+            ]
+        };
+
+        var manifest = await new ReportGenerator().GenerateAsync(result, output);
+        var html = await File.ReadAllTextAsync(manifest.HtmlPath);
+        var csv = await File.ReadAllTextAsync(manifest.FindingsCsvPath);
+
+        Assert.DoesNotContain(payload, html);
+        Assert.Contains("&lt;script&gt;alert(1)&lt;/script&gt;", html);
+        Assert.Contains("'=HYPERLINK", csv);
+    }
+
+    [Fact]
     public void IeModeDisclaimer_IsExplicit()
     {
         Assert.Contains("automation limitations", ComplianceDisclaimers.IeMode, StringComparison.OrdinalIgnoreCase);
@@ -163,6 +199,7 @@ public sealed class CoreTests
     {
         Assert.Throws<ArgumentException>(() => CrawlRequestValidator.ValidateStartUrl("https://example.gov", []));
         Assert.Throws<ArgumentException>(() => CrawlRequestValidator.ValidateStartUrl("https://evil.test", ["example.gov"]));
+        Assert.Throws<ArgumentException>(() => CrawlRequestValidator.ValidateStartUrl("https://localhost", ["localhost"]));
 
         var uri = CrawlRequestValidator.ValidateStartUrl("https://sub.example.gov/path", ["*.example.gov"]);
 
@@ -172,9 +209,27 @@ public sealed class CoreTests
     [Fact]
     public void ApiKeySecurity_RequiresExactConfiguredKey()
     {
-        Assert.True(ApiKeySecurity.IsValid("local-key", ["local-key"]));
-        Assert.False(ApiKeySecurity.IsValid("wrong", ["local-key"]));
-        Assert.False(ApiKeySecurity.IsValid("", ["local-key"]));
+        var material = new ApiKeyMaterial([SHA256.HashData(Encoding.UTF8.GetBytes("local-key"))]);
+
+        Assert.True(ApiKeySecurity.IsValid("local-key", material));
+        Assert.False(ApiKeySecurity.IsValid("wrong", material));
+        Assert.False(ApiKeySecurity.IsValid("", material));
+    }
+
+    [Fact]
+    public void FileInputValidator_RestrictsExtensionSizeAndBaseDirectory()
+    {
+        var baseDirectory = Path.Combine(Path.GetTempPath(), "legacy-a11y-input-base", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(baseDirectory);
+        var pdfPath = Path.Combine(baseDirectory, "rules.pdf");
+        File.WriteAllText(pdfPath, "%PDF-test");
+
+        var resolved = FileInputValidator.ResolveExistingFile("rules.pdf", baseDirectory, ".pdf", 1024);
+
+        Assert.Equal(Path.GetFullPath(pdfPath), resolved);
+        Assert.Throws<ArgumentException>(() => FileInputValidator.ResolveExistingFile("../rules.pdf", baseDirectory, ".pdf", 1024));
+        Assert.Throws<ArgumentException>(() => FileInputValidator.ResolveExistingFile("rules.pdf", baseDirectory, ".csv", 1024));
+        Assert.Throws<ArgumentException>(() => FileInputValidator.ResolveExistingFile("rules.pdf", baseDirectory, ".pdf", 2));
     }
 
     [Fact(Skip = "Requires a real PDF fixture and PdfPig restore; sample placeholder documents the supported workflow.")]

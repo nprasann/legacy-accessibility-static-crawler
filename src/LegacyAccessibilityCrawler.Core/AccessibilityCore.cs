@@ -2,6 +2,7 @@ using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using System.Net;
 
 namespace LegacyAccessibilityCrawler.Core;
 
@@ -55,6 +56,7 @@ public sealed record CrawlerOptions
     public bool RedactQueryStrings { get; init; } = true;
     public bool ManualSession { get; init; }
     public bool Headless { get; init; } = true;
+    public bool AcceptInsecureCertificates { get; init; }
     public IReadOnlyList<string> AllowedDomains { get; init; } = [];
 }
 
@@ -66,6 +68,18 @@ public sealed record OutputPathOptions
 public sealed record CrawlSecurityOptions
 {
     public IReadOnlyList<string> AllowedDomains { get; init; } = [];
+    public bool AllowPrivateNetworkTargets { get; init; }
+    public int MaxPagesLimit { get; init; } = 100;
+    public int MaxDepthLimit { get; init; } = 5;
+    public int MaxDelaySecondsLimit { get; init; } = 30;
+    public int JobTimeoutMinutes { get; init; } = 30;
+}
+
+public sealed record FileInputOptions
+{
+    public string BaseInputDirectory { get; init; } = "inputs";
+    public long MaxPdfBytes { get; init; } = 25 * 1024 * 1024;
+    public long MaxCsvBytes { get; init; } = 5 * 1024 * 1024;
 }
 
 public static class OutputPathSanitizer
@@ -111,11 +125,16 @@ public static class OutputPathSanitizer
 
 public static class CrawlRequestValidator
 {
-    public static Uri ValidateStartUrl(string? startUrl, IEnumerable<string> allowedDomains)
+    public static Uri ValidateStartUrl(string? startUrl, IEnumerable<string> allowedDomains, bool allowPrivateNetworkTargets = false)
     {
         if (!Uri.TryCreate(startUrl, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
         {
             throw new ArgumentException("StartUrl must be an absolute http or https URL.", nameof(startUrl));
+        }
+
+        if (!allowPrivateNetworkTargets && IsPrivateOrLocalTarget(uri.Host))
+        {
+            throw new ArgumentException("Private, loopback, and link-local crawl targets are disabled by default.");
         }
 
         var domains = allowedDomains.Where(d => !string.IsNullOrWhiteSpace(d)).Select(d => d.Trim()).ToArray();
@@ -132,15 +151,41 @@ public static class CrawlRequestValidator
         return uri;
     }
 
-    public static CrawlerOptions ValidateAndNormalize(CrawlerOptions options, IEnumerable<string> configuredAllowedDomains, string baseOutputDirectory)
+    public static CrawlerOptions ValidateAndNormalize(
+        CrawlerOptions options,
+        IEnumerable<string> configuredAllowedDomains,
+        string baseOutputDirectory,
+        bool allowPrivateNetworkTargets = false,
+        int maxPagesLimit = 100,
+        int maxDepthLimit = 5,
+        int maxDelaySecondsLimit = 30)
     {
-        ValidateStartUrl(options.StartUrl, configuredAllowedDomains);
+        ValidateStartUrl(options.StartUrl, configuredAllowedDomains, allowPrivateNetworkTargets);
+        ValidateCrawlLimits(options, maxPagesLimit, maxDepthLimit, maxDelaySecondsLimit);
         var output = OutputPathSanitizer.ResolveOutputDirectory(options.OutputDirectory, baseOutputDirectory);
         return options with
         {
             OutputDirectory = output,
             AllowedDomains = configuredAllowedDomains.Where(d => !string.IsNullOrWhiteSpace(d)).Select(d => d.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
         };
+    }
+
+    private static void ValidateCrawlLimits(CrawlerOptions options, int maxPagesLimit, int maxDepthLimit, int maxDelaySecondsLimit)
+    {
+        if (options.MaxPages is < 1 || options.MaxPages > maxPagesLimit)
+        {
+            throw new ArgumentException($"MaxPages must be between 1 and {maxPagesLimit}.", nameof(options));
+        }
+
+        if (options.CrawlDepth is < 0 || options.CrawlDepth > maxDepthLimit)
+        {
+            throw new ArgumentException($"CrawlDepth must be between 0 and {maxDepthLimit}.", nameof(options));
+        }
+
+        if (options.DelaySeconds is < 0 || options.DelaySeconds > maxDelaySecondsLimit)
+        {
+            throw new ArgumentException($"DelaySeconds must be between 0 and {maxDelaySecondsLimit}.", nameof(options));
+        }
     }
 
     private static bool HostMatches(string host, string pattern)
@@ -152,6 +197,81 @@ public static class CrawlRequestValidator
         }
 
         return string.Equals(host, pattern, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsPrivateOrLocalTarget(string host)
+    {
+        if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return IPAddress.TryParse(host, out var address) &&
+            (IPAddress.IsLoopback(address) || IsPrivateOrLinkLocal(address));
+    }
+
+    private static bool IsPrivateOrLinkLocal(IPAddress address)
+    {
+        if (address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+        {
+            var bytes = address.GetAddressBytes();
+            return bytes[0] == 10 ||
+                bytes[0] == 127 ||
+                bytes[0] == 169 && bytes[1] == 254 ||
+                bytes[0] == 172 && bytes[1] is >= 16 and <= 31 ||
+                bytes[0] == 192 && bytes[1] == 168;
+        }
+
+        if (address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
+        {
+            return address.IsIPv6LinkLocal || address.IsIPv6SiteLocal || IPAddress.IsLoopback(address);
+        }
+
+        return false;
+    }
+}
+
+public static class FileInputValidator
+{
+    public static string ResolveExistingFile(string requestedPath, string baseInputDirectory, string requiredExtension, long maxBytes)
+    {
+        if (string.IsNullOrWhiteSpace(requestedPath))
+        {
+            throw new ArgumentException("Input file path is required.", nameof(requestedPath));
+        }
+
+        if (Path.IsPathFullyQualified(requestedPath) || requestedPath.Contains('\0') ||
+            requestedPath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Contains(".."))
+        {
+            throw new ArgumentException("Input files must be relative paths inside the configured input directory.", nameof(requestedPath));
+        }
+
+        if (!string.Equals(Path.GetExtension(requestedPath), requiredExtension, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException($"Input file must use the {requiredExtension} extension.", nameof(requestedPath));
+        }
+
+        var baseDirectory = Path.GetFullPath(string.IsNullOrWhiteSpace(baseInputDirectory) ? "inputs" : baseInputDirectory);
+        var resolved = Path.GetFullPath(Path.Combine(baseDirectory, requestedPath));
+        var normalizedBase = Path.TrimEndingDirectorySeparator(baseDirectory) + Path.DirectorySeparatorChar;
+        var normalizedResolved = Path.TrimEndingDirectorySeparator(resolved) + Path.DirectorySeparatorChar;
+        if (!normalizedResolved.StartsWith(normalizedBase, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+        {
+            throw new ArgumentException("Input file path is outside the configured input directory.", nameof(requestedPath));
+        }
+
+        var info = new FileInfo(resolved);
+        if (!info.Exists)
+        {
+            throw new ArgumentException("Input file was not found.", nameof(requestedPath));
+        }
+
+        if (info.Length > maxBytes)
+        {
+            throw new ArgumentException($"Input file exceeds the configured {maxBytes} byte size limit.", nameof(requestedPath));
+        }
+
+        return resolved;
     }
 }
 

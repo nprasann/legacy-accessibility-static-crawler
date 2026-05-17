@@ -51,7 +51,7 @@ public sealed class ReportGenerator : IReportGenerator
     private static string RenderHtml(ScanResult result)
     {
         var templateText = TryLoadTemplate("report.html.sbn") ?? DefaultHtmlTemplate;
-        return Template.Parse(templateText).Render(ToTemplateModel(result), member => member.Name);
+        return Template.Parse(templateText).Render(ToHtmlTemplateModel(result), member => member.Name);
     }
 
     private static async Task WriteFindingsCsvAsync(string path, IReadOnlyList<AccessibilityFinding> findings, CancellationToken cancellationToken)
@@ -62,18 +62,18 @@ public sealed class ReportGenerator : IReportGenerator
         await csv.WriteRecordsAsync(findings.Select(f => new
         {
             f.FindingId,
-            f.PageUrl,
-            f.RuleId,
-            f.Standard,
-            f.SuccessCriterion,
-            f.IssueType,
+            PageUrl = CsvSafe(f.PageUrl),
+            RuleId = CsvSafe(f.RuleId),
+            Standard = CsvSafe(f.Standard),
+            SuccessCriterion = CsvSafe(f.SuccessCriterion),
+            IssueType = CsvSafe(f.IssueType),
             Severity = f.Severity.ToString(),
             f.Confidence,
-            f.Evidence,
-            f.Selector,
+            Evidence = CsvSafe(f.Evidence),
+            Selector = CsvSafe(f.Selector),
             f.NeedsManualReview,
-            f.RemediationHint,
-            f.Source,
+            RemediationHint = CsvSafe(f.RemediationHint),
+            Source = CsvSafe(f.Source),
             BrowserMode = f.BrowserMode.ToString()
         }), cancellationToken);
     }
@@ -86,15 +86,25 @@ public sealed class ReportGenerator : IReportGenerator
         await csv.WriteRecordsAsync(findings.Select(f => new
         {
             WorkItemType = "User Story",
-            Title = $"Fix accessibility issue: {f.IssueType.Replace('-', ' ')}",
-            Description = $"{f.Evidence}\n\nRule: {f.RuleId} {f.Standard} {f.SuccessCriterion}\nSelector: {f.Selector}\nSource URL: {f.PageUrl}",
+            Title = CsvSafe($"Fix accessibility issue: {f.IssueType.Replace('-', ' ')}"),
+            Description = CsvSafe($"{f.Evidence}\n\nRule: {f.RuleId} {f.Standard} {f.SuccessCriterion}\nSelector: {f.Selector}\nSource URL: {f.PageUrl}"),
             AcceptanceCriteria = "- The affected element meets the referenced accessibility rule.\n- Keyboard navigation still works.\n- The same crawler check no longer reports the issue.\n- Manual accessibility validation is completed where required.",
             Severity = f.Severity.ToString(),
-            Tags = $"accessibility; {f.Standard}; {f.RuleId}; {(f.NeedsManualReview ? "manual-review" : "static-check")}",
-            SourceUrl = f.PageUrl,
-            RuleReference = $"{f.Standard} {f.SuccessCriterion} {f.RuleId}",
-            Evidence = f.Evidence
+            Tags = CsvSafe($"accessibility; {f.Standard}; {f.RuleId}; {(f.NeedsManualReview ? "manual-review" : "static-check")}"),
+            SourceUrl = CsvSafe(f.PageUrl),
+            RuleReference = CsvSafe($"{f.Standard} {f.SuccessCriterion} {f.RuleId}"),
+            Evidence = CsvSafe(f.Evidence)
         }), cancellationToken);
+    }
+
+    private static string CsvSafe(string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return "";
+        }
+
+        return value[0] is '=' or '+' or '-' or '@' ? $"'{value}" : value;
     }
 
     private static object ToTemplateModel(ScanResult result)
@@ -117,6 +127,33 @@ public sealed class ReportGenerator : IReportGenerator
             recurring = recurring,
             ie_mode = result.Options.BrowserMode == BrowserMode.EdgeIeModeAssisted,
             disclaimer = result.Disclaimer
+        };
+    }
+
+    private static object ToHtmlTemplateModel(ScanResult result)
+    {
+        static string H(string? value) => HtmlEncoder.Default.Encode(value ?? "");
+        var findings = result.Findings.Select(f => new
+        {
+            severity = H(f.Severity.ToString()),
+            page_url = H(f.PageUrl),
+            issue_type = H(f.IssueType),
+            rule_id = H(f.RuleId),
+            evidence = H(f.Evidence),
+            needs_manual_review = H(f.NeedsManualReview.ToString())
+        }).ToList();
+
+        return new
+        {
+            product = H(ProductInfo.Name),
+            version = H(ProductInfo.Version),
+            commit = H(ProductInfo.Commit),
+            build_date_utc = H(ProductInfo.BuildDateUtc),
+            page_count = result.Pages.Count,
+            finding_count = result.Findings.Count,
+            manual_review_count = result.Findings.Count(f => f.NeedsManualReview),
+            disclaimer = H(result.Disclaimer),
+            scan = new { findings }
         };
     }
 

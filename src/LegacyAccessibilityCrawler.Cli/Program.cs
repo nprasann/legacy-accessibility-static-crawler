@@ -97,12 +97,13 @@ static async Task<int> CrawlAsync(string[] args)
         OutputDirectory = output,
         ManualSession = parsed.GetBool("manual-session"),
         Headless = !parsed.GetBool("show-browser"),
+        AcceptInsecureCertificates = parsed.GetBool("accept-insecure-certificates"),
         EnableWcag22EnhancedRules = string.Equals(parsed.Get("standard"), "wcag22", StringComparison.OrdinalIgnoreCase),
         EnableSection508Rules = !string.Equals(parsed.Get("section508"), "false", StringComparison.OrdinalIgnoreCase),
         RulesPdfPath = parsed.Get("rules-pdf"),
         AllowedDomains = allowedDomains
     };
-    options = CrawlRequestValidator.ValidateAndNormalize(options, options.AllowedDomains, "reports");
+    options = CrawlRequestValidator.ValidateAndNormalize(options, options.AllowedDomains, "reports", allowPrivateNetworkTargets: true);
 
     var pdfRules = new List<AccessibilityRule>();
     if (!string.IsNullOrWhiteSpace(options.RulesPdfPath))

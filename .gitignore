@@ -15,6 +15,5 @@ TestResults/
 *.nupkg
 *.zip
 appsettings.local.json
-appsettings.Production.json
 appsettings.*.local.json
 **/appsettings.*.local.json

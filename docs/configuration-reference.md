@@ -6,9 +6,17 @@ This page explains the settings used by the API/UI and CLI workflows. For non-te
 
 | Key | Type | Default | What It Does |
 | --- | --- | --- | --- |
-| `ApiSecurity:ApiKeys` | string array | `change-me-local-dev-key` | API keys accepted in the `x-api-key` header. Change this before sharing the API on any network. |
+| `ApiSecurity__ApiKeys__0` or `LEGACY_A11Y_API_KEY` | environment variable | none | API key accepted in the `x-api-key` header. The API fails closed when no key is configured. |
 | `Security:BaseOutputDirectory` | string | `reports` | The only folder where API-generated reports may be written. Output paths outside this folder are rejected. |
-| `Crawler:AllowedDomains` | string array | `localhost`, `127.0.0.1` | Domains the API is allowed to crawl. Add the authorized target host before crawling from the UI or Swagger. Wildcards like `*.example.gov` are supported. |
+| `Security:BaseInputDirectory` | string | `inputs` | The only folder where API PDF/CSV imports may read files. |
+| `Security:AllowPrivateNetworkTargets` | boolean | `false` | Allows loopback, private, and link-local crawl targets only when explicitly enabled. |
+| `Security:MaxPagesLimit` | number | `100` | Maximum `MaxPages` accepted by the API. |
+| `Security:MaxDepthLimit` | number | `5` | Maximum crawl depth accepted by the API. |
+| `Security:MaxDelaySecondsLimit` | number | `30` | Maximum page delay accepted by the API. |
+| `Security:JobTimeoutMinutes` | number | `30` | API crawl job timeout. |
+| `Security:EnableSwagger` | boolean | `false` | Enables Swagger outside development. Protected by API key when enabled. |
+| `Security:EnableUi` | boolean | `false` | Enables the browser UI outside development. Protected by API key when enabled. |
+| `Crawler:AllowedDomains` | string array | empty | Domains the API is allowed to crawl. Add the authorized target host before crawling from the UI or Swagger. Wildcards like `*.example.gov` are supported. |
 
 Environment variable examples:
 
@@ -38,7 +46,7 @@ Security__BaseOutputDirectory="reports"
 
 ## API Key Use In The UI
 
-The UI has an API key box at the top of the crawl form. Use the value configured in `ApiSecurity:ApiKeys`. The starter local key is for first-run testing only.
+The UI has an API key box at the top of the crawl form. Use the value configured in `ApiSecurity__ApiKeys__0` or `LEGACY_A11Y_API_KEY`. No default key is accepted.
 
 ## Safe Output Paths
 

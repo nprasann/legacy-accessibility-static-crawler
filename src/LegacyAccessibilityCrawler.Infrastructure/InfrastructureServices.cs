@@ -100,7 +100,7 @@ public sealed class SeleniumCrawlerService : ICrawlerService
 
     private static ChromeOptions CreateChromeOptions(CrawlerOptions options)
     {
-        var chromeOptions = new ChromeOptions { AcceptInsecureCertificates = true };
+        var chromeOptions = new ChromeOptions { AcceptInsecureCertificates = options.AcceptInsecureCertificates };
         if (options.Headless && !options.ManualSession)
         {
             chromeOptions.AddArgument("--headless=new");
@@ -112,7 +112,7 @@ public sealed class SeleniumCrawlerService : ICrawlerService
 
     private static EdgeOptions CreateEdgeOptions(CrawlerOptions options)
     {
-        var edgeOptions = new EdgeOptions { AcceptInsecureCertificates = true };
+        var edgeOptions = new EdgeOptions { AcceptInsecureCertificates = options.AcceptInsecureCertificates };
         if (options.Headless && !options.ManualSession)
         {
             edgeOptions.AddArgument("--headless=new");
@@ -124,7 +124,8 @@ public sealed class SeleniumCrawlerService : ICrawlerService
 
     private static IWebDriver CreateIeModeAssistedEdgeDriver()
     {
-        var edgeOptions = new EdgeOptions { AcceptInsecureCertificates = true };
+        var edgeOptions = new EdgeOptions { AcceptInsecureCertificates = false };
+        // IE mode requires enterprise Edge security zone and site-list policy configuration outside Selenium.
         edgeOptions.AddArgument("--ie-mode-test");
         return new EdgeDriver(edgeOptions);
     }
@@ -295,9 +296,20 @@ public sealed class PdfRulesLoaderService : IPdfRulesLoaderService
 
     public async Task<PdfExtractionResult> ExtractAsync(string pdfPath, string outputDirectory, CancellationToken cancellationToken = default)
     {
-        if (!File.Exists(pdfPath))
+        var pdfInfo = new FileInfo(pdfPath);
+        if (!pdfInfo.Exists)
         {
             throw new FileNotFoundException("Rules PDF was not found.", pdfPath);
+        }
+
+        if (!string.Equals(pdfInfo.Extension, ".pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException("Rules file must be a PDF.", nameof(pdfPath));
+        }
+
+        if (pdfInfo.Length > 25 * 1024 * 1024)
+        {
+            throw new ArgumentException("Rules PDF exceeds the maximum supported file size.", nameof(pdfPath));
         }
 
         Directory.CreateDirectory(outputDirectory);
@@ -388,6 +400,22 @@ public sealed class ManualFindingsImporter : IManualFindingsImporter
 {
     public async Task<IReadOnlyList<ManualFinding>> ImportAsync(string csvPath, CancellationToken cancellationToken = default)
     {
+        var csvInfo = new FileInfo(csvPath);
+        if (!csvInfo.Exists)
+        {
+            throw new FileNotFoundException("Manual findings CSV was not found.", csvPath);
+        }
+
+        if (!string.Equals(csvInfo.Extension, ".csv", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException("Manual findings import must be a CSV file.", nameof(csvPath));
+        }
+
+        if (csvInfo.Length > 5 * 1024 * 1024)
+        {
+            throw new ArgumentException("Manual findings CSV exceeds the maximum supported file size.", nameof(csvPath));
+        }
+
         await using var stream = File.OpenRead(csvPath);
         using var reader = new StreamReader(stream);
         using var csv = new CsvReader(reader, CultureInfo.InvariantCulture);

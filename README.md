@@ -207,7 +207,7 @@ Endpoints:
 - `GET /api/rulepacks/{id}`
 - `GET /api/version`
 
-API routes require an `x-api-key` header. For first-run local testing the sample key is `change-me-local-dev-key`; change it before exposing the API beyond your workstation. API crawls are also restricted to `Crawler:AllowedDomains` in `appsettings.json`, which should contain only systems you are authorized to test.
+API routes require an `x-api-key` header. Configure the key with `ApiSecurity__ApiKeys__0` or `LEGACY_A11Y_API_KEY` in the process environment; no default API key is committed. API crawls are also restricted to `Crawler:AllowedDomains` in configuration, which should contain only systems you are authorized to test.
 
 ## Browser UI
 
